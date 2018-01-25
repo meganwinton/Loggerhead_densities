@@ -1,0 +1,679 @@
+---
+title: "Apply a geostatistical mixed effects model to satellite tagging data"
+author: "Megan Winton"
+date: "November 3, 2017"
+output: html_document
+---
+
+This document provides the background and code necessary to apply a space-time geostatistical mixed effects model and plot spatio-temporal variation in relative densities from satellite tagging data. It also includes code to fit four alternative space use estimators to illustrate how predictions from the space-time model differ from conventional methods when applied to satellite tagging data.
+
+##Data description and processing
+
+The code below applies a space-time geostatistical mixed effects model and four more commonly applied space use estimators to filtered locations reported from a 74 cm (curved carapace length) loggerhead that was tagged in the mid-Atlantic in May of 2012. This track was selected because the tag reported for almost an entire year (reporting 2,061 locations until transmissions became sporadic near the end of tag life in May 2013) and captured the turtle’s movements on summer foraging grounds in the mid-Atlantic as well as the area in which it overwintered south of Cape Hatteras, North Carolina. Locations are binned by month (the time step we have found is most often requested by managers) and aggregated over the 20-km resolution Atlantic Marine Assessment Program for Protected Species (AMAPPS) spatial grid (areas = 200 km squared) in R using the ‘sp’ (Pebesma et al. 2005; Bivand et al. 2013) and ‘raster’ packages (Hijmans 2015). The AMAPPS grid is bounded by the coastline to constrain the loggerhead’s space use to the ocean. The code below executes these pre-processing steps.
+
+```{r, echo=TRUE,message=FALSE,warning=FALSE}
+###################################################################################################################
+##1. Load required libraries
+#install R-INLA package - will need to run the first time if not installed on your local machine
+#install.packages("INLA", repos="https://www.math.ntnu.no/inla/R/stable")
+library(TMB)
+library(RandomFields)
+library(INLA) # FROM: http://www.r-inla.org/download
+library(data.table)
+library(maptools)
+library(raster)
+library(rgdal)
+library(sp)
+library(fields)
+library(adehabitatMA)
+library(ggplot2)
+library(ggmap)
+library(spatialEco)
+
+###################################################################################################################
+##2. Set map projections, read in required shape files, and set up AMAPPS grid
+ll<-CRS("+init=epsg:4326") #NAD83/WGS84  (i.e., LAT & LON)
+azimuth <- 40 #Azimuth of projection central line (degrees east of north at the projection origin)
+origin <- c(-75, 35) #Projection origin (longitude, latitude)
+k <- 0.9996 #Scale for projection
+finproj <- paste('+proj=omerc +lonc=', origin[1], ' +lat_0=', origin[2], ' +alpha=', azimuth, ' +k_0=', k, ' +ellps=GRS80 +datum=NAD83 +units=m', sep = '') #Oblique Mercator projection (center)
+usa=readShapePoly("shpfiles/48_states",proj4string=ll)
+
+#read in 50/100 m bathy
+iso50=readShapeSpatial('shpfiles/200mcontour_etopo1',proj4string=ll)
+#reproject US and bathy
+fusa=spTransform(usa,CRS(finproj))
+fiso=spTransform(iso50,CRS(finproj))
+
+## Set up AMAPPS raster of 10x10 km grid cells
+bras = raster('Geostatistical mixed effects model/Raster_10km.asc')
+plot(bras)
+projection(bras)=finproj
+projection(bras)
+#Aggregate for now - otherwise this will take forever to run on a 10x10 km grid
+bras=aggregate(bras,fact=2)
+bras
+
+pras=projectRaster(bras,crs=ll)
+# Crop to the ocean using US coastline
+mlim=mask(bras,fusa,inverse=T)
+plot(mlim)
+#This is a broad area - constrain spatial extent
+b <- as(extent(-81.5, -65, 25, 41.5), 'SpatialPolygons')
+crs(b) <- crs(usa)
+fb=spTransform(b,CRS(finproj))
+
+#Check that this looks right in both map projections
+alim=crop(mlim,fb)
+plot(alim)
+plot(fusa,add=T)
+blim=projectRaster(alim,crs=ll)
+plot(blim)
+plot(usa,add=T)
+
+#convert to Spatial Pixels
+aras=as(alim,'SpatialPixelsDataFrame')
+class(aras)
+aras #20 by 20 km grid
+proj4string(aras)=CRS(finproj) #reproject
+
+###################################################################################################################
+##3. Read in and plot filtered track
+#Note that this is the same track used for the previous examples, but with the spotty locations at the end of tag life removed
+dlay=read.csv("Geostatistical mixed effects model/FilteredTrack_Example.csv",header=T)
+#Format date-time columns
+dlay$Date=as.POSIXct(as.POSIXlt(strptime(as.character(dlay$date),format=c("%m/%d/%Y %H:%M"),"UTC")))
+dlay$month=month(dlay$Date)
+dlay$day=mday(dlay$Date)
+dlay$yday=yday(dlay$Date)
+summary(dlay)
+#convert to spatial points data frame and plot by deployment region
+coordinates(dlay)=~plon+plat
+  class(dlay)
+proj4string(dlay)=finproj
+play=spTransform(dlay,ll) #Reproject into lat lon for plotting 
+
+#Plot filtered track
+cape=fortify(usa) #Necessary step for plotting polygons in ggplot
+cont=fortify(iso50)
+play=as.data.frame(play) #Convert back to dataframe for plotting
+
+#Set up ggplot object and plot. For details on plotting with ggplot, see http://ggplot2.tidyverse.org/reference/
+p <- ggplot() + geom_polygon(data = cape, aes(x=long, y=lat, group=group))
+p+coord_map(projection="mercator") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  coord_fixed(xlim = c(-77.5, -73.0),ylim=c(33.5,39.5)) +
+  geom_point(aes(x=plon,y=plat,bg=as.factor(month)),data=play,pch=21,cex=3) +
+  geom_point(aes(x=-73.763,y=38.782),pch=4,cex=1.5) +
+  #theme(legend.positio="none")+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=18),
+        legend.text=element_text(size=14),
+        legend.title=element_text(size=18)) +
+  guides(fill=guide_legend(title="Month")) +
+  geom_polygon(data = cont, aes(x=long, y=lat, group=group),colour='black',fill=NA) +
+  geom_polygon(data = cape, aes(x=long, y=lat, group=group),cex=2)
+
+#Assign locations to the AMAPPs raster
+dlay@data$locs=1
+locs=rasterize(dlay,bras,field=dlay@data$locs,fun='sum')
+
+#convert to Spatial Pixels
+spras=as(bras,'SpatialPixelsDataFrame')
+
+#For this individual example, cut down the AMAPPS grid to extent of data
+b <- as(extent(-77.3, -73.0, 33.7, 39.5), 'SpatialPolygons')
+crs(b) <- crs(usa)
+fb=spTransform(b,CRS(finproj))
+
+alim=crop(mlim,fb)
+  plot(alim)
+  plot(fusa,add=T)
+
+#convert to Spatial Pixels
+aras=as(alim,'SpatialPixelsDataFrame')
+
+##Subset locations by month
+m1=dlay[dlay@data$month == 1,]
+m2=dlay[dlay@data$month == 2,]
+m3=dlay[dlay@data$month == 3,]
+m4=dlay[dlay@data$month == 4,]
+m5=dlay[dlay@data$month == 5,]
+m6=dlay[dlay@data$month == 6,]
+m7=dlay[dlay@data$month == 7,]
+m8=dlay[dlay@data$month == 8,]
+m9=dlay[dlay@data$month == 9,]
+m10=dlay[dlay@data$month == 10,]
+m11=dlay[dlay@data$month == 11,]
+m12=dlay[dlay@data$month == 12,]
+
+#Assign monthly locations to the AMAPPs raster 
+cp1=rasterize(m1,alim,field=m1@data$locs,fun=sum)
+r1=extract(cp1,aras)
+r1[is.na(r1)]<-0
+
+cp2=rasterize(m2,alim,field=m2@data$locs,fun=sum)
+r2=extract(cp2,aras)
+r2[is.na(r2)]<-0
+
+cp3=rasterize(m3,alim,field=m3@data$locs,fun=sum)
+r3=extract(cp3,aras)
+r3[is.na(r3)]<-0
+
+cp4=rasterize(m4,alim,field=m4@data$locs,fun=sum)
+r4=extract(cp4,aras)
+r4[is.na(r4)]<-0
+
+cp5=rasterize(m5,alim,field=m5@data$locs,fun=sum)
+r5=extract(cp5,aras)
+r5[is.na(r5)]<-0
+
+cp6=rasterize(m6,alim,field=m6@data$locs,fun=sum)
+r6=extract(cp6,aras)
+r6[is.na(r6)]<-0
+
+cp7=rasterize(m7,alim,field=m7@data$locs,fun=sum)
+r7=extract(cp7,aras)
+r7[is.na(r7)]<-0
+
+cp8=rasterize(m8,alim,field=m8@data$locs,fun=sum)
+r8=extract(cp8,aras)
+r8[is.na(r8)]<-0
+
+cp9=rasterize(m9,alim,field=m9@data$locs,fun=sum)
+r9=extract(cp9,aras)
+r9[is.na(r9)]<-0
+
+cp10=rasterize(m10,alim,field=m10@data$locs,fun=sum)
+r10=extract(cp10,aras)
+r10[is.na(r10)]<-0
+
+cp11=rasterize(m11,alim,field=m11@data$locs,fun=sum)
+r11=extract(cp11,aras)
+r11[is.na(r11)]<-0
+
+cp12=rasterize(m12,alim,field=m12@data$locs,fun=sum)
+r12=extract(cp12,aras)
+r12[is.na(r12)]<-0
+
+##Format data for model fitting - 'long-format' vectors of counts of locations per grid cell per month
+grids_i=rep(seq(1:dim(aras)[1]),12) #Set up spatial grid
+counts_i=c(r1,r2,r3,r4,r5,r6,r7,r8,r9,r10,r11,r12) #Assign counts of locations to in each month to each grid cell
+month_i=rep.int(1:12,c(rep(dim(aras)[1],12))) #Create vector of month identifier equal to the number of grid cells
+#check and make sure lengths are the same - if not this will cause an indexing error and TMB will crash when run
+length(grids_i)
+length(counts_i)
+length(month_i)
+```
+
+###Parameter estimation and spatial prediction
+
+Variations in space and time are treated as random effects and are estimated using a stochastic partial differential equation approximation approach, which approximates a continuous Gaussian random field using a Gaussian Markov random field (see Lindgren et al. 2011 for details). In short, the approach approximates the full, continuous spatial field using weighted sums of piecewise linear basis functions, which are defined over the region of interest on a triangulated mesh (Lindgren et al. 2011); below we use the R-INLA software to calculate the mesh and the sparse matrices used for this approximation (see Lindgren et al. 2011 and Lindgren & Rue 2015 for full details on mesh construction and the approximation). While each reported location could be specified as a mesh node, in most telemetry applications the large number of locations available will render such an approach computationally infeasible (Banerjee et al. 2008). For all simulations and applications conducted here, we use a predictive process approach, where spatial and seasonal fields are approximated as being piecewise constant at a series of gridded ‘knots’ to reduce dimensionality (Banerjee et al. 2008). We use the package 'Template Model Builder' (Kristensen et al. 2016) to estimate fixed effects parameters via non-linear optimization of the maximum marginal likelihood, which integrates across random effects using the Laplace approximation. The estimated fixed and random effects are then used to predict the distribution and relative density at each location within the study area in each month. Readers interested in further details regarding the statistical theory underlying the models and specific details related to the spatial approximation and computational approaches are referred to Lindgren et al. (2011), Lindgren & Rue (2015), and Thorson et al. (2015). 
+
+```{r, echo=TRUE,message=FALSE,warning=FALSE}
+###################################################################################################################
+##4. Fit space-time geostatistical mixed effects model on a monthly time step
+##First step is to create the mesh 
+t_xy=coordinates(aras) #Extract AMAPPS grid cell coordinates
+plot(t_xy)
+# create mesh using functions from the R-INLA package
+mesh = inla.mesh.create( t_xy, plot.delay=NULL, refine=FALSE)
+plot(mesh) #Triangulated mesh of grid cells - larger triangles connect borders to the outer region
+#You can add boundaries using different arguments to the 'inla.mesh.create' function
+  #See the R-INLA website for examples: http://www.r-inla.org/
+# Create matrices in INLA for the SPDE approximation
+spde <- inla.spde2.matern(mesh, alpha=2)
+
+## Compile and load model specified in cpp file
+compile( "space_time_GSTMEM.cpp" )
+dyn.load( dynlib("space_time_GSTMEM") )
+
+## Make inputs for model fitting
+# Data list - note that this must match the objects declared in the .cpp file
+Data = list("n_s"=dim(aras)[1], #number of sites - here # of grid cells used for predictive process approx.
+            "n_t"= 12,  #number of time steps - here 12 months of the year
+            "a_s"=c(rep(10000^2,dim(aras)[1])), #area of each grid cell
+            "c_i"=counts_i, #vector with counts of locations in each grid cell in each month - created above
+            "s_i"=grids_i-1, #vector of grid cells for each time step - created above
+            "t_i"=month_i-1, #vector of months for each grid cell in each time step - created above
+            "M0"=spde$param.inla$M0, "M1"=spde$param.inla$M1, "M2"=spde$param.inla$M2 ) #Sparse matrices from mesh specified above
+
+#Parameter list - again must match the parameter objects declared in the .cpp file
+  #Note that this includes both random and fixed effects
+  #Intial values set to zero for all
+Params = list("beta0"=0, #Intercept term
+              "ln_tau_O"=0, "ln_tau_E"=0, "ln_kappa"=0, #Fixed effects related to spatial components
+              "omega_s"=rep(0,mesh$n), "epsilon_st"=matrix(0,nrow=mesh$n,ncol=Data$n_t)) #Random space and space-time effects
+
+#Declare which of the above parameters are random effects
+Random = c("omega_s", "epsilon_st")
+
+# Build and run - these two steps will take a while given the size of the grid, so be patient
+ObjST = MakeADFun( data=Data, parameters=Params, random=Random, DLL='space_time_GSTMEM' ) 
+OptST = nlminb( start=ObjST$par, objective=ObjST$fn, gradient=ObjST$gr, control=list(trace=1, eval.max=1e4, iter.max=1e4),DLL="space_time")
+#Save diagnostics
+OptST[["final_diagnostics"]] = data.frame( "Name"=names(ObjST$par), "final_gradient"=ObjST$gr(OptST$par))
+OptST #Check for convergence and make sure final gradient for all parameter estimates is small
+ReportST = ObjST$report()
+SDST = sdreport( ObjST ) #Report standard errors of the parameter estimates
+
+#Random effects
+#Extract overall estimate and random effect for each grid cell
+beta <- ObjST$env$parList()$beta0 #Intercept term on the log scale
+reS <- ObjST$env$parList()$omega_s #Spatial random effect
+reT<- ObjST$env$parList()$epsilon_st #Space-time random effect
+
+#Use parameters estimates to predict relative densities in each grid cell
+tdens<-NULL #Set up empty vector to store values
+cp=aras #Set equal to spatial extent defined above
+for (i in 1:dim(cp)[1]){ #Predict 'overall' density in each grid cell
+  tdens[i]=exp(beta+reS[i])
+}
+
+#Create new spatial pixels dataframe to save the predicted densities at each time step for plotting
+stp=cp 
+stp@data$overall=tdens #Add overall densities from above to each grid cell
+
+#Plot
+image(stp["overall"],col=rev(terrain.colors(255)),axes=T, main = "Overall",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["overall"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$overall)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#####Plot predictions by month
+#Jan
+jandens<-NULL
+for (i in 1:dim(cp)[1])
+  jandens[i]=exp(beta+reS[i]+reT[i,1]) #Add intercept, overall spatial RE, and space-time RE for that time step
+stp@data$jan=jandens
+
+#now replot with prettier color scheme
+image(stp["jan"],col=rev(terrain.colors(255)),axes=T, main = "January",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["jan"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$jan)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Feb
+febdens<-NULL
+for (i in 1:dim(cp)[1])
+  febdens[i]=exp(beta+reS[i]+reT[i,2])
+stp@data$feb=febdens
+
+image(stp["feb"],col=rev(terrain.colors(255)),axes=T, main = "February",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["feb"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$feb)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Mar
+mardens<-NULL
+for (i in 1:dim(cp)[1])
+  mardens[i]=exp(beta+reS[i]+reT[i,3])
+stp@data$mar=mardens
+
+image(stp["mar"],col=rev(terrain.colors(255)),axes=T, main = "March",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["mar"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$mar)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Apr
+aprdens<-NULL
+for (i in 1:dim(cp)[1])
+  aprdens[i]=exp(beta+reS[i]+reT[i,4])
+stp@data$apr=aprdens
+
+image(stp["apr"],col=rev(terrain.colors(255)),axes=T, main = "April",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["apr"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$apr)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#May
+maydens<-NULL
+for (i in 1:dim(cp)[1])
+  maydens[i]=exp(beta+reS[i]+reT[i,5])
+stp@data$may=maydens
+
+image(stp["may"],col=rev(terrain.colors(255)),axes=T, main = "May",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["may"],axes=F,add=T,col=terrain.colors(255),zlim=c(0,max(stp@data$may)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Jun
+jundens<-NULL
+for (i in 1:dim(cp)[1])
+  jundens[i]=exp(beta+reS[i]+reT[i,6])
+stp@data$jun=jundens
+
+#now replot with prettier color scheme
+image(stp["jun"],col=rev(terrain.colors(255)),axes=T, main = "June",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["jun"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$jun)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Jul
+juldens<-NULL
+for (i in 1:dim(cp)[1])
+  juldens[i]=exp(beta+reS[i]+reT[i,7])
+stp@data$jul=juldens
+
+image(stp["jul"],col=rev(terrain.colors(255)),axes=T, main = "July",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["jul"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$jul)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Aug
+augdens<-NULL
+for (i in 1:dim(cp)[1])
+  augdens[i]=exp(beta+reS[i]+reT[i,8])
+stp@data$aug=augdens
+
+image(stp["aug"],col=rev(terrain.colors(255)),axes=T, main = "August",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["aug"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$aug)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Sep
+sepdens<-NULL
+for (i in 1:dim(cp)[1])
+  sepdens[i]=exp(beta+reS[i]+reT[i,9])
+stp@data$sep=sepdens
+
+image(stp["sep"],col=rev(terrain.colors(255)),axes=T, main = "September",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["sep"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$sep)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Oct
+octdens<-NULL
+for (i in 1:dim(cp)[1])
+  octdens[i]=exp(beta+reS[i]+reT[i,10])
+stp@data$oct=octdens
+
+image(stp["oct"],col=rev(terrain.colors(255)),axes=T, main = "October",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["oct"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$oct)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Nov
+novdens<-NULL
+for (i in 1:dim(cp)[1])
+  novdens[i]=exp(beta+reS[i]+reT[i,11])
+stp@data$nov=novdens
+
+image(stp["nov"],col=rev(terrain.colors(255)),axes=T, main = "November",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["nov"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$nov)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Dec
+decdens<-NULL
+for (i in 1:dim(cp)[1])
+  decdens[i]=exp(beta+reS[i]+reT[i,12])
+stp@data$dec=decdens
+
+image(stp["dec"],col=rev(terrain.colors(255)),axes=T, main = "December",
+      xlim=c(-1.7e+05,1.7e+05),ylim=c(-1.05e+05,4.9e+05))
+plot(fusa,add=T,col="grey")
+plot(fiso,add=T)
+image.plot(stp["dec"],axes=F,add=T,col=rev(terrain.colors(255)),zlim=c(0,max(stp@data$dec)),
+           legend.only=T,
+           smallplot=c(.6,.7,.25,.45))
+box()
+
+#Save this
+grfST=as.data.frame(stp)
+#write.csv(grfST,'STG_Example.csv',row.names=F)
+
+#If just reading back in to plot - unhash the below lines
+#stp=read.csv('Geostatistical mixed effects model/STG_Example.csv',header=T)
+#convert to spatial points data frame and set projection
+#coordinates(stp)=~x+y
+#proj4string(stp)=finproj
+```
+
+###Comparison with other methods
+
+To illustrate how predictions from the space-time model differ from conventional methods when applied to satellite tagging data, we also apply four alternative space use estimators: 1) the minimum convex polygon (Mohr 1947); 2) the conventional kernel density method (Worton 1989); 3) simple track densities; and 4) the Markov chain approach (Whitehead and Jonsen 2013). A brief description of each is provided here, but interested readers should consult the cited references for further details. Minimum convex polygons, which are the smallest possible convex polygon containing a specified proportion of the available telemetry locations (e.g. 50%), are estimated using functions in the R package “adehabitatHR” (Calenge 2006). Conventional kernel density estimates are generated using default function settings in the same package; the approach estimates a bivariate kernel function over each location and averages the values of these functions over space (Calenge 2006). Track densities are estimated by summing the number of observed locations in each grid cell and dividing by the total number of locations; this corresponds to the simplest approximation of a multinomial resource selection function (McCracken et al. 1998). We also apply the Markov chain approach of Whitehead and Jonsen (2013), which can be used to produce unbiased measures of relative density from animal tracking data when movements among cells can be considered as a time-homogenous Markov chain. The resulting densities from each method are scaled from 0 to 1, and the smallest area encompassing 50% of the resulting probability distribution with that of the true underlying density field. This corresponds to the 50% home range metric often used to identify core use areas when conventional methods are applied (Calenge 2006).
+
+```{r, echo=TRUE,message=FALSE,warning=FALSE}
+###################################################################################################################
+##5. Compare predicted 50% core use area with other methods
+stp@data$overmn=stp@data$overall/sum(stp@data$overall) #Scale overall values to 1 to approximate the multinomial RSF
+pover=rasterize(stp,alim,field=stp@data$overmn,fun=sum) #Rasterize
+plot(pover)
+grf50 <- raster.vol(pover, p=0.50) #Calculate 50% core use area
+  plot(grf50)
+#Convert from raster to spatial polygon for plotting 
+stgrf50 <- rasterToPolygons(grf50, dissolve=TRUE)
+stgrf50 = spTransform(stgrf50,ll) #reproject into lat-lon for plotting
+
+#Plot with ggplot
+stgrf=fortify(stgrf50) #Fortify core area polygons
+p+coord_map(projection="mercator") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  coord_fixed(xlim = c(-77.5, -73.0),ylim=c(33.5,39.5)) +
+  theme(legend.position="none")+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=18)) +
+  guides(fill=guide_legend(title="Month")) +
+  geom_polygon(data = stgrf[stgrf$id==2,], aes(x=long, y=lat, group=group,bg=id),cex=2) +
+  geom_polygon(data = cont, aes(x=long, y=lat, group=group),colour='black',fill=NA) +
+  geom_polygon(data = cape, aes(x=long, y=lat, group=group),cex=2) 
+
+
+###Minimum Convex Polygon method
+library(adehabitatHR)
+#Make obs into SpatialPoints
+dlay@data$id='turtle1'
+## estimates the MCP
+mincp <- mcp(dlay[,37],percent=50)
+mincp@data$inside=1
+rpmcp50 = spTransform(mincp,ll)
+
+#Plot
+p+coord_map(projection="mercator") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  coord_fixed(xlim = c(-77.5, -73.0),ylim=c(33.5,39.5)) +
+  theme(legend.position="none")+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=18)) +
+  guides(fill=guide_legend(title="Month")) +
+  geom_polygon(data = rpmcp50, aes(x=long, y=lat, group=group,bg=id),cex=2) +
+  geom_polygon(data = cont, aes(x=long, y=lat, group=group),colour='black',fill=NA) +
+  geom_polygon(data = cape, aes(x=long, y=lat, group=group),cex=2) 
+
+###Conventional kernel density method
+##Kernel UDs
+kud=kernelUD(dlay[,37],grid=aras)
+ud=estUDm2spixdf(kud)
+ud@data$sckud=ud@data$ X1/sum(ud@data$ X1) #scaled
+#Convert to raster and estimate core use area
+rkud=raster(ud["sckud"])
+kud50 <- raster.vol(rkud, p=0.50)
+kover <- as(kud50, 'SpatialPixelsDataFrame')
+pk50 <- rasterToPolygons(kud50, dissolve=TRUE)
+rpk50 = spTransform(pk50,ll)
+
+#Plot
+rpk=fortify(rpk50) #Fortify core area polygons
+p+coord_map(projection="mercator") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  coord_fixed(xlim = c(-77.5, -73.0),ylim=c(33.5,39.5)) +
+  theme(legend.position="none")+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=18)) +
+  guides(fill=guide_legend(title="Month")) +
+  geom_polygon(data = rpk[rpk$id==2,], aes(x=long, y=lat, group=group,bg=id),cex=2) +
+  geom_polygon(data = cont, aes(x=long, y=lat, group=group),colour='black',fill=NA) +
+  geom_polygon(data = cape, aes(x=long, y=lat, group=group),cex=2) 
+
+
+####Track density method
+cp=count.points(dlay,aras) #Count points per grid cell - note will get a warning 
+cp@data$scaled=cp@data$x/sum(cp@data$x) #Scale by dividing by the sum total
+rtd=raster(cp["scaled"])
+td50 <- raster.vol(rtd, p=0.50)
+tdover <- as(td50, 'SpatialPixelsDataFrame')
+ptd50 <- rasterToPolygons(td50, dissolve=TRUE)
+rptd50 = spTransform(ptd50,ll)
+
+#Plot
+rptd=fortify(rptd50) #Fortify core area polygons
+p+coord_map(projection="mercator") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  coord_fixed(xlim = c(-77.5, -73.0),ylim=c(33.5,39.5)) +
+  theme(legend.position="none")+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=18)) +
+  guides(fill=guide_legend(title="Month")) +
+  geom_polygon(data = rptd[rptd$id==2,], aes(x=long, y=lat, group=group,bg=id),cex=2) +
+  geom_polygon(data = cont, aes(x=long, y=lat, group=group),colour='black',fill=NA) +
+  geom_polygon(data = cape, aes(x=long, y=lat, group=group),cex=2) 
+
+#####Markov Chain Densities - code modified from that provided in the supplmentary material of Whitehead and Jonsen (2013)
+play=as.data.frame(dlay)
+str(play)
+summary(play)
+play$ind=seq(1:length(play[,1])) #Specify individual
+qqq = play$ind
+qqq[qqq==1] = 0 #Set first/tagging loc to 0
+qqq[qqq>1] = 1
+play$qqq=qqq
+#now recreate this with W$J code
+rsim=raster(aras)
+coordinates(play)=~plon+plat
+play@data$cell=extract(rsim,play,cellnumbers=T)
+summary(play@data$cell)
+play=as.data.frame(play)
+pc=play$cell.cells 
+#if NA, assign to 'out' box
+pc[is.na(pc)]<-length(rsim)+1 #of grid cells plus 1
+## number of cells
+numcell = length(rsim)+1
+cellarea = c(rep(1*1, numcell-1), NA)
+extracell = as.numeric(is.na(cellarea[numcell]))
+## create transition matrix
+tmat = sparseMatrix(i=pc[1:length(pc)-1], j=pc[2:length(pc)], x=qqq[2:length(qqq)],  dims=c(numcell, numcell))
+object.size(tmat)
+nnzero(tmat)
+dim(tmat)
+tmat = as.matrix(tmat)
+#scale by rows
+library(vegan)
+pmat=decostand(tmat,method="total",MARGIN=1)
+eig.out = eigen((t(pmat))) # yields left eigenvalues and eigenvectors
+eig.out$values = Re(eig.out$values) # take only the real part 
+eig.out$vectors = Re(eig.out$vectors) # take only the real part
+## Markov density
+qj = which(eig.out$values == max(eig.out$values)) # index of eigenvalue 1
+propta = eig.out$vectors[,qj] # eigenvecter assoicated w eigenvalue 1
+## correct for cellarea
+propta = propta[1:(numcell - extracell)] / cellarea[1:(numcell - extracell)]
+## standardize
+propta = propta / sum(propta)
+#add on to raster and try again
+mcras=setValues(rsim,propta)
+#Calculate 50% HR
+mc50=raster.vol(mcras,p=0.50)
+mcdens=as(mcras,"SpatialPixelsDataFrame")
+mcover <- as(mc50, 'SpatialPixelsDataFrame')
+pmc50 <- rasterToPolygons(mc50, dissolve=TRUE)
+rpmc50 = spTransform(pmc50,ll)
+
+#Plot
+rpmc=fortify(rpmc50) #Fortify core area polygons
+p+coord_map(projection="mercator") +  
+  xlab("Longitude") +
+  ylab("Latitude") +
+  coord_fixed(xlim = c(-77.5, -73.0),ylim=c(33.5,39.5)) +
+  theme(legend.position="none")+
+  theme(axis.text=element_text(size=14),
+        axis.title=element_text(size=18)) +
+  guides(fill=guide_legend(title="Month")) +
+  geom_polygon(data = rpmc[rpmc$id==2,], aes(x=long, y=lat, group=group,bg=id),cex=2) +
+  geom_polygon(data = cont, aes(x=long, y=lat, group=group),colour='black',fill=NA) +
+  geom_polygon(data = cape, aes(x=long, y=lat, group=group),cex=2) 
+```
+
+Literature Cited
+
+Banerjee S, Gelfand AE, Finley AO, Sang H (2008) Gaussian predictive process models for large spatial data sets. J R Stat Soc Series B Stat Methodol 70(4): 825–848 
+
+Bivand R, Keitt T, Rowlingson B (2015) rgdal: Bindings for the geospatial data abstraction library. R package version 1.1-1. http://CRAN.R-project.org/package=rgdal
+
+Calenge C (2006) The package adehabitat for the R software: a tool for the analysis of space and habitat use by animals. Ecol Modell 197:516-519
+
+Kristensen K, Nielsen A, Berg CW, Skaug H, Bell BM (2016) TMB: Automatic differentiation and Laplace approximation. J Stat Softw 70:1-21
+
+Lindgren F, Rue H (2015) Bayesian spatial modelling with R-INLA. J Stat Softw
+63: 1-25
+
+Lindgren F, Rue H, Lindstrӧm J (2011) An explicit link between Gaussian fields and Gaussian Markov random fields: the stochastic partial differential equation approach. J R Stat Soc Series B Stat Methodol 73:423-498
+
+McCracken ML, Manly BFJ, Heyden MV (1998) The use of discrete-choice models for evaluating resource selection. J Agric Biol Environ Stat 3:268-279
+
+Mohr, C. 1947. Table of equivalent populations of North American small mammals.
+American Midland Naturalist, 37, 223–249
+
+Pebesma EJ, Bivand RS (2005) Classes and methods for spatial data in R. R News 5: http://cran.r-project.org/doc/Rnews/.
+
+R Core Team (2016) R: A language and environment for statistical computing. R Foundation for Statistical Computing, Vienna, Austria. URL https://www.R-project.org/
+
+Thorson JT, Shelton AO, Ward EJ, Skaug HJ (2015) Geostatistical delta-generalized linear mixed models improve precision for abundance indices for West Coast groundfishes. ICES J Mar Sci 72:1297-1310
+
+Whitehead H, Jonsen ID (2013) Inferring animal densities from tracking data using Markov chains. PLOS ONE 8:e60901. doi:10.1371/journal.pone.0060901
+
+Worton, B. 1989. Kernel methods for estimating the utilization distribution in
+home-range studies. Ecology, 70, 164–168
