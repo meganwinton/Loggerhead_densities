@@ -46,7 +46,7 @@ fusa=spTransform(usa,CRS(finproj))
 fiso=spTransform(iso50,CRS(finproj))
 
 ## Set up AMAPPS raster of 10x10 km grid cells
-bras = raster('Geostatistical mixed effects model/Raster_10km.asc')
+bras = raster('Raster_10km.asc')
 plot(bras)
 projection(bras)=finproj
 projection(bras)
@@ -80,7 +80,7 @@ proj4string(aras)=CRS(finproj) #reproject
 ###################################################################################################################
 ##3. Read in and plot filtered track
 #Note that this is the same track used for the previous examples, but with the spotty locations at the end of tag life removed
-dlay=read.csv("Geostatistical mixed effects model/FilteredTrack_Example.csv",header=T)
+dlay=read.csv("FilteredTrack_Example.csv",header=T)
 #Format date-time columns
 dlay$Date=as.POSIXct(as.POSIXlt(strptime(as.character(dlay$date),format=c("%m/%d/%Y %H:%M"),"UTC")))
 dlay$month=month(dlay$Date)
@@ -473,7 +473,7 @@ grfST=as.data.frame(stp)
 #write.csv(grfST,'STG_Example.csv',row.names=F)
 
 #If just reading back in to plot - unhash the below lines
-#stp=read.csv('Geostatistical mixed effects model/STG_Example.csv',header=T)
+#stp=read.csv('STG_Example.csv',header=T)
 #convert to spatial points data frame and set projection
 #coordinates(stp)=~x+y
 #proj4string(stp)=finproj
